@@ -1,39 +1,971 @@
-name: Build JSON
-
+name: Build Speed Meter APK
 on:
   push:
-    branches:
-      - main
-  schedule:
-    # * is a special character in YAML so you have to quote this string
-    - cron:  '0 * * * *'
-
+  workflow_dispatch:
+env:
+  APP_NAME: "عدّاد القيادة"
+  APP_ID: "com.mytools.speed"
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install PyGithub
-    - name: Run script and commit changes
-      run: |
-        python release.py
-        echo "Setting up git credentials..."
-        git remote set-url origin https://x-access-token:"$GITHUB_TOKEN"@github.com/"$GITHUB_REPOSITORY".git
-        git config --global user.email "actions@github.com"
-        git config --global user.name "actions"
-        echo "Git credentials configured."
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Generate Kotlin Android project
+        run: |
+          mkdir -p app/src/main/java/com/mytools/speed
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'SpeedMeter'
+          include ':app'
+          EOF
 
-        git checkout main
-        git add .
-        git commit -m "Automatic update of data" && git push --set-upstream origin main || true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          cat > build.gradle <<'EOF'
+          plugins {
+            id 'com.android.application' version '8.2.2' apply false
+            id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          echo "org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8" > gradle.properties
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+            id 'com.android.application'
+            id 'org.jetbrains.kotlin.android'
+          }
+          android {
+            namespace 'com.mytools.speed'
+            compileSdk 34
+            defaultConfig {
+              applicationId 'com.mytools.speed'
+              minSdk 26
+              targetSdk 34
+              versionCode 1
+              versionName '1.0'
+            }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+            kotlinOptions { jvmTarget = '17' }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+            <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+            <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+            <uses-permission android:name="android.permission.VIBRATE"/>
+            <application android:label="عدّاد القيادة" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="portrait" android:configChanges="orientation|screenSize|keyboardHidden">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+              <service android:name=".TrackingService" android:exported="false" android:foregroundServiceType="location"/>
+            </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/mytools/speed/Tracker.kt <<'EOF'
+          package com.mytools.speed
+
+          import android.content.Context
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object Tracker {
+              data class Row(val date: String, val dist: Double, val max: Double, val sec: Double)
+
+              var speed = 0.0
+              var dist = 0.0
+              var max = 0.0
+              var sec = 0.0
+              var running = false
+              var sim = false
+              var over = false
+              var limit = 100
+              var mute = false
+              var overlay = false
+              var total = 0.0
+              var oilKm = 3000
+              var oilStart = 0.0
+              var oilNotified = false
+              var day = ""
+              var listener: (() -> Unit)? = null
+
+              fun oilSince(): Double = total - oilStart
+
+              fun oilDue(): Boolean = oilSince() >= oilKm * 1000.0
+
+              fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+
+              private fun prefs(c: Context) = c.getSharedPreferences("spd", Context.MODE_PRIVATE)
+
+              fun load(c: Context) {
+                  val p = prefs(c)
+                  limit = p.getInt("limit", 100)
+                  mute = p.getBoolean("mute", false)
+                  overlay = p.getBoolean("overlay", false)
+                  total = p.getString("total", null)?.toDoubleOrNull() ?: 0.0
+                  oilKm = p.getInt("oilKm", 3000)
+                  oilStart = p.getString("oilStart", null)?.toDoubleOrNull() ?: 0.0
+                  oilNotified = p.getBoolean("oilNotified", false)
+                  day = today()
+                  dist = 0.0
+                  max = 0.0
+                  sec = 0.0
+                  val s = p.getString("day_$day", null)
+                  if (s != null) {
+                      val a = s.split(";")
+                      if (a.size == 3) {
+                          dist = a[0].toDoubleOrNull() ?: 0.0
+                          max = a[1].toDoubleOrNull() ?: 0.0
+                          sec = a[2].toDoubleOrNull() ?: 0.0
+                      }
+                  }
+              }
+
+              fun save(c: Context) {
+                  prefs(c).edit()
+                      .putString("day_$day", "$dist;$max;$sec")
+                      .putInt("limit", limit)
+                      .putBoolean("mute", mute)
+                      .putBoolean("overlay", overlay)
+                      .putString("total", "$total")
+                      .putInt("oilKm", oilKm)
+                      .putString("oilStart", "$oilStart")
+                      .putBoolean("oilNotified", oilNotified)
+                      .apply()
+              }
+
+              fun rollDay(c: Context) {
+                  if (day != today()) {
+                      save(c)
+                      day = today()
+                      dist = 0.0
+                      max = 0.0
+                      sec = 0.0
+                  }
+              }
+
+              fun history(c: Context): List<Row> {
+                  val out = ArrayList<Row>()
+                  for ((k, v) in prefs(c).all) {
+                      if (k.startsWith("day_") && v is String) {
+                          val d = k.substring(4)
+                          if (d == day) continue
+                          val a = v.split(";")
+                          if (a.size == 3) {
+                              out.add(Row(d, a[0].toDoubleOrNull() ?: 0.0, a[1].toDoubleOrNull() ?: 0.0, a[2].toDoubleOrNull() ?: 0.0))
+                          }
+                      }
+                  }
+                  out.add(Row(day, dist, max, sec))
+                  out.sortByDescending { it.date }
+                  return out
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/mytools/speed/TrackingService.kt <<'EOF'
+          package com.mytools.speed
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.media.AudioManager
+          import android.media.ToneGenerator
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.provider.Settings
+          import android.speech.tts.TextToSpeech
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.WindowManager
+          import android.widget.TextView
+          import java.util.Locale
+
+          class TrackingService : Service(), LocationListener {
+              companion object {
+                  const val ACTION_START = "com.mytools.speed.START"
+                  const val ACTION_STOP = "com.mytools.speed.STOP"
+                  const val ACTION_SIM = "com.mytools.speed.SIM"
+                  const val ACTION_REFRESH = "com.mytools.speed.REFRESH"
+              }
+
+              private lateinit var lm: LocationManager
+              private val handler = Handler(Looper.getMainLooper())
+              private var last: Location? = null
+              private var tts: TextToSpeech? = null
+              private var ttsOk = false
+              private var tone: ToneGenerator? = null
+              private var lastWarn = 0L
+              private var lastSave = 0L
+              private var wm: WindowManager? = null
+              private var overlayView: TextView? = null
+              private var fg = false
+              private var simSpeed = 0.0
+              private var simDir = 1
+
+              private val simTick = object : Runnable {
+                  override fun run() {
+                      simSpeed += simDir * 7.0
+                      if (simSpeed >= Tracker.limit + 25) simDir = -1
+                      if (simSpeed <= 0.0) {
+                          simSpeed = 0.0
+                          simDir = 1
+                      }
+                      feed(simSpeed, simSpeed / 3.6, if (simSpeed > 1) 1.0 else 0.0)
+                      handler.postDelayed(this, 1000)
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                  tts = TextToSpeech(this) { st ->
+                      if (st == TextToSpeech.SUCCESS) {
+                          val r = tts?.setLanguage(Locale("ar")) ?: TextToSpeech.LANG_NOT_SUPPORTED
+                          ttsOk = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
+                      }
+                  }
+                  tone = try {
+                      ToneGenerator(AudioManager.STREAM_ALARM, 100)
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (Tracker.day.isEmpty()) Tracker.load(this)
+                  val a = intent?.action
+                  if (a == ACTION_STOP) {
+                      stopAll()
+                      return START_NOT_STICKY
+                  }
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                      stopAll()
+                      return START_NOT_STICKY
+                  }
+                  goForeground()
+                  when (a) {
+                      ACTION_START -> startReal()
+                      ACTION_SIM -> {
+                          if (Tracker.sim) {
+                              stopAll()
+                              return START_NOT_STICKY
+                          }
+                          startSim()
+                      }
+                      else -> {}
+                  }
+                  applyOverlay()
+                  Tracker.listener?.invoke()
+                  return START_NOT_STICKY
+              }
+
+              private fun goForeground() {
+                  if (fg) return
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("spd", "عدّاد القيادة", NotificationManager.IMPORTANCE_LOW))
+                  val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                  val n: Notification = Notification.Builder(this, "spd")
+                      .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                      .setContentTitle("عدّاد القيادة يعمل")
+                      .setContentText("يقيس السرعة والمسافة")
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  fg = true
+              }
+
+              @SuppressLint("MissingPermission")
+              private fun startReal() {
+                  handler.removeCallbacks(simTick)
+                  Tracker.sim = false
+                  Tracker.oilNotified = false
+                  try {
+                      lm.removeUpdates(this)
+                  } catch (e: Exception) {
+                  }
+                  last = null
+                  lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, this, Looper.getMainLooper())
+                  Tracker.running = true
+              }
+
+              private fun startSim() {
+                  try {
+                      lm.removeUpdates(this)
+                  } catch (e: Exception) {
+                  }
+                  Tracker.sim = true
+                  Tracker.running = true
+                  simSpeed = 0.0
+                  simDir = 1
+                  handler.removeCallbacks(simTick)
+                  handler.post(simTick)
+              }
+
+              private fun stopAll() {
+                  handler.removeCallbacks(simTick)
+                  try {
+                      lm.removeUpdates(this)
+                  } catch (e: Exception) {
+                  }
+                  Tracker.running = false
+                  Tracker.sim = false
+                  Tracker.over = false
+                  Tracker.speed = 0.0
+                  Tracker.save(this)
+                  hideOverlay()
+                  Tracker.listener?.invoke()
+                  if (fg) {
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                      fg = false
+                  }
+                  stopSelf()
+              }
+
+              override fun onLocationChanged(loc: Location) {
+                  if (loc.hasAccuracy() && loc.accuracy > 40f) return
+                  var v = if (loc.hasSpeed() && loc.speed >= 0f) loc.speed.toDouble() else -1.0
+                  var d = 0.0
+                  var dt = 0.0
+                  val p = last
+                  if (p != null) {
+                      dt = (loc.time - p.time) / 1000.0
+                      if (dt > 0) {
+                          val dd = p.distanceTo(loc).toDouble()
+                          val vi = dd / dt
+                          if (v < 0) v = vi
+                          if (v > 1 && vi < 70 && dd < 400) {
+                              d = dd
+                          } else {
+                              dt = 0.0
+                          }
+                      } else {
+                          dt = 0.0
+                      }
+                  }
+                  last = loc
+                  feed(if (v < 0) 0.0 else v * 3.6, d, minOf(dt, 10.0))
+              }
+
+              override fun onProviderEnabled(provider: String) {}
+
+              override fun onProviderDisabled(provider: String) {}
+
+              @Deprecated("Deprecated in Java")
+              override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+
+              private fun feed(kmhIn: Double, addDist: Double, addSec: Double) {
+                  Tracker.rollDay(this)
+                  val kmh = if (kmhIn < 2) 0.0 else kmhIn
+                  Tracker.speed = kmh
+                  if (!Tracker.sim) {
+                      Tracker.dist += addDist
+                      Tracker.total += addDist
+                      Tracker.sec += addSec
+                      if (kmh > Tracker.max) Tracker.max = kmh
+                  }
+                  val over = kmh > Tracker.limit
+                  Tracker.over = over
+                  val now = System.currentTimeMillis()
+                  if (over && now - lastWarn > 6000) {
+                      lastWarn = now
+                      alarm()
+                  }
+                  if (!Tracker.sim && Tracker.oilDue() && !Tracker.oilNotified) {
+                      Tracker.oilNotified = true
+                      oilAlert()
+                  }
+                  updateOverlay()
+                  if (now - lastSave > 5000) {
+                      lastSave = now
+                      Tracker.save(this)
+                  }
+                  Tracker.listener?.invoke()
+              }
+
+              private fun alarm() {
+                  try {
+                      val vb = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                      vb.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 300, 150, 300), -1))
+                  } catch (e: Exception) {
+                  }
+                  if (Tracker.mute) return
+                  tone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 300)
+                  if (ttsOk) tts?.speak("تمشي سريع، خفف السرعة", TextToSpeech.QUEUE_FLUSH, null, "warn")
+              }
+
+              private fun oilAlert() {
+                  try {
+                      val nm = getSystemService(NotificationManager::class.java)
+                      nm.createNotificationChannel(NotificationChannel("oil", "تنبيه الزيت", NotificationManager.IMPORTANCE_HIGH))
+                      val pi = PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                      val n = Notification.Builder(this, "oil")
+                          .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                          .setContentTitle("حان موعد تبديل الزيت")
+                          .setContentText("قطعت " + Tracker.oilKm + " كم منذ آخر تبديل")
+                          .setContentIntent(pi)
+                          .setAutoCancel(true)
+                          .build()
+                      nm.notify(2, n)
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      val vb = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                      vb.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 500, 200, 500, 200, 500), -1))
+                  } catch (e: Exception) {
+                  }
+                  if (!Tracker.mute && ttsOk) tts?.speak("حان موعد تبديل الزيت", TextToSpeech.QUEUE_ADD, null, "oil")
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun applyOverlay() {
+                  if (Tracker.overlay && Settings.canDrawOverlays(this)) showOverlay() else hideOverlay()
+              }
+
+              private fun showOverlay() {
+                  if (overlayView != null) return
+                  val w = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  wm = w
+                  val tv = TextView(this)
+                  tv.textSize = 22f
+                  tv.setTextColor(Color.WHITE)
+                  tv.gravity = Gravity.CENTER
+                  tv.typeface = Typeface.DEFAULT_BOLD
+                  tv.setPadding(dp(18), dp(10), dp(18), dp(10))
+                  val bg = GradientDrawable()
+                  bg.cornerRadius = dp(28).toFloat()
+                  bg.setColor(0xCC1E9E4A.toInt())
+                  tv.background = bg
+                  tv.text = "0\nكم/س"
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = dp(12)
+                  lp.y = dp(140)
+                  var ix = 0
+                  var iy = 0
+                  var tx = 0f
+                  var ty = 0f
+                  tv.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              ix = lp.x
+                              iy = lp.y
+                              tx = e.rawX
+                              ty = e.rawY
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              lp.x = ix + (e.rawX - tx).toInt()
+                              lp.y = iy + (e.rawY - ty).toInt()
+                              w.updateViewLayout(tv, lp)
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+                  try {
+                      w.addView(tv, lp)
+                      overlayView = tv
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun hideOverlay() {
+                  val v = overlayView ?: return
+                  try {
+                      wm?.removeView(v)
+                  } catch (e: Exception) {
+                  }
+                  overlayView = null
+              }
+
+              private fun updateOverlay() {
+                  val v = overlayView ?: return
+                  v.text = "${Tracker.speed.toInt()}\nكم/س"
+                  (v.background as GradientDrawable).setColor(if (Tracker.over) 0xCCE5484D.toInt() else 0xCC1E9E4A.toInt())
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacks(simTick)
+                  hideOverlay()
+                  try {
+                      lm.removeUpdates(this)
+                  } catch (e: Exception) {
+                  }
+                  tts?.shutdown()
+                  tone?.release()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/mytools/speed/MainActivity.kt <<'EOF'
+          package com.mytools.speed
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.res.ColorStateList
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.location.LocationManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.ScrollView
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.util.Locale
+          import kotlin.math.roundToInt
+
+          class MainActivity : Activity() {
+              private val BG = 0xFF0E0F13.toInt()
+              private val CARD = 0xFF17181E.toInt()
+              private val KEY = 0xFF23252E.toInt()
+              private val SUB = 0xFF8B8FA0.toInt()
+              private val GREEN = 0xFF1E9E4A.toInt()
+              private val RED = 0xFFE5484D.toInt()
+              private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+              private lateinit var warnTv: TextView
+              private lateinit var speedTv: TextView
+              private lateinit var limitTv: TextView
+              private lateinit var distTv: TextView
+              private lateinit var maxTv: TextView
+              private lateinit var timeTv: TextView
+              private lateinit var startBtn: Button
+              private lateinit var simBtn: Button
+              private lateinit var histBox: LinearLayout
+              private lateinit var oilWarn: TextView
+              private lateinit var oilInfo: TextView
+              private lateinit var oilKmTv: TextView
+              private lateinit var oilBar: ProgressBar
+              private lateinit var totalTv: TextView
+              private var tick = 0
+              private var pendingSim = false
+              private var askedNotif = false
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun rounded(color: Int, r: Int): GradientDrawable {
+                  val g = GradientDrawable()
+                  g.setColor(color)
+                  g.cornerRadius = dp(r).toFloat()
+                  return g
+              }
+
+              private fun text(t: String, size: Float, color: Int = Color.WHITE, bold: Boolean = false): TextView {
+                  val v = TextView(this)
+                  v.text = t
+                  v.textSize = size
+                  v.setTextColor(color)
+                  if (bold) v.typeface = Typeface.DEFAULT_BOLD
+                  return v
+              }
+
+              private fun button(t: String, color: Int, size: Float = 18f): Button {
+                  val b = Button(this)
+                  b.text = t
+                  b.textSize = size
+                  b.setTextColor(Color.WHITE)
+                  b.isAllCaps = false
+                  b.background = rounded(color, 18)
+                  return b
+              }
+
+              private fun lpMatch(top: Int): LinearLayout.LayoutParams {
+                  val p = LinearLayout.LayoutParams(MATCH, WRAP)
+                  p.topMargin = dp(top)
+                  return p
+              }
+
+              private fun stat(parent: LinearLayout, label: String): TextView {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.gravity = Gravity.CENTER
+                  box.background = rounded(CARD, 18)
+                  box.setPadding(dp(6), dp(12), dp(6), dp(12))
+                  val l = text(label, 12f, SUB)
+                  l.gravity = Gravity.CENTER
+                  val v = text("0", 18f, Color.WHITE, true)
+                  v.gravity = Gravity.CENTER
+                  box.addView(l)
+                  box.addView(v)
+                  val lp = LinearLayout.LayoutParams(0, WRAP, 1f)
+                  lp.setMargins(dp(4), 0, dp(4), 0)
+                  parent.addView(box, lp)
+                  return v
+              }
+
+              private fun fmtDist(m: Double): String =
+                  if (m < 1000) "${m.roundToInt()} م" else String.format(Locale.US, "%.2f كم", m / 1000)
+
+              private fun fmtKm(m: Double): String = String.format(Locale.US, "%.1f كم", m / 1000)
+
+              private fun oilChanged() {
+                  if (!Tracker.oilDue()) Tracker.oilNotified = false
+                  Tracker.save(this)
+                  refresh()
+              }
+
+              private fun fmtTime(s: Double): String {
+                  val t = s.toInt()
+                  val h = t / 3600
+                  val m = t % 3600 / 60
+                  val x = t % 60
+                  return if (h > 0) String.format(Locale.US, "%d:%02d", h, m) else String.format(Locale.US, "%02d:%02d", m, x)
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (Tracker.day.isEmpty()) Tracker.load(this)
+                  window.decorView.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  buildUi()
+              }
+
+              private fun buildUi() {
+                  val sv = ScrollView(this)
+                  sv.setBackgroundColor(BG)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(16), dp(28), dp(16), dp(24))
+                  sv.addView(root)
+
+                  root.addView(text("عدّاد القيادة", 22f, Color.WHITE, true))
+
+                  warnTv = text("تمشي سريع! خفف السرعة", 20f, Color.WHITE, true)
+                  warnTv.gravity = Gravity.CENTER
+                  warnTv.background = rounded(RED, 16)
+                  warnTv.setPadding(dp(12), dp(14), dp(12), dp(14))
+                  warnTv.visibility = View.GONE
+                  root.addView(warnTv, lpMatch(12))
+
+                  oilWarn = text("حان موعد تبديل الزيت!", 20f, Color.WHITE, true)
+                  oilWarn.gravity = Gravity.CENTER
+                  oilWarn.background = rounded(0xFFF08C00.toInt(), 16)
+                  oilWarn.setPadding(dp(12), dp(14), dp(12), dp(14))
+                  oilWarn.visibility = View.GONE
+                  root.addView(oilWarn, lpMatch(12))
+
+                  val card = LinearLayout(this)
+                  card.orientation = LinearLayout.VERTICAL
+                  card.gravity = Gravity.CENTER_HORIZONTAL
+                  card.background = rounded(CARD, 26)
+                  card.setPadding(dp(16), dp(18), dp(16), dp(18))
+                  speedTv = text("0", 88f, Color.WHITE, true)
+                  speedTv.gravity = Gravity.CENTER
+                  card.addView(speedTv)
+                  val unit = text("كم / ساعة", 15f, SUB)
+                  unit.gravity = Gravity.CENTER
+                  card.addView(unit)
+                  val limRow = LinearLayout(this)
+                  limRow.orientation = LinearLayout.HORIZONTAL
+                  limRow.gravity = Gravity.CENTER
+                  val minus = button("−", KEY, 24f)
+                  val plus = button("+", KEY, 24f)
+                  limitTv = text("", 18f, Color.WHITE, true)
+                  limitTv.gravity = Gravity.CENTER
+                  limRow.addView(minus, LinearLayout.LayoutParams(dp(52), dp(52)))
+                  limRow.addView(limitTv, LinearLayout.LayoutParams(dp(170), WRAP))
+                  limRow.addView(plus, LinearLayout.LayoutParams(dp(52), dp(52)))
+                  card.addView(limRow, lpMatch(14))
+                  root.addView(card, lpMatch(12))
+                  minus.setOnClickListener {
+                      Tracker.limit = maxOf(20, Tracker.limit - 5)
+                      Tracker.save(this)
+                      refresh()
+                  }
+                  plus.setOnClickListener {
+                      Tracker.limit = minOf(200, Tracker.limit + 5)
+                      Tracker.save(this)
+                      refresh()
+                  }
+
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  distTv = stat(row, "المسافة اليوم")
+                  maxTv = stat(row, "أعلى سرعة")
+                  timeTv = stat(row, "وقت القيادة")
+                  root.addView(row, lpMatch(12))
+
+                  val oil = LinearLayout(this)
+                  oil.orientation = LinearLayout.VERTICAL
+                  oil.background = rounded(CARD, 22)
+                  oil.setPadding(dp(16), dp(14), dp(16), dp(14))
+                  oil.addView(text("تبديل الزيت", 18f, Color.WHITE, true))
+                  oilInfo = text("", 14f, SUB)
+                  oil.addView(oilInfo, lpMatch(4))
+                  oilBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  oilBar.max = 1000
+                  val bp = LinearLayout.LayoutParams(MATCH, dp(14))
+                  bp.topMargin = dp(8)
+                  oil.addView(oilBar, bp)
+                  val oRow = LinearLayout(this)
+                  oRow.orientation = LinearLayout.HORIZONTAL
+                  oRow.gravity = Gravity.CENTER
+                  val oMinus = button("−", KEY, 22f)
+                  val oPlus = button("+", KEY, 22f)
+                  oilKmTv = text("", 16f, Color.WHITE, true)
+                  oilKmTv.gravity = Gravity.CENTER
+                  oRow.addView(oMinus, LinearLayout.LayoutParams(dp(48), dp(48)))
+                  oRow.addView(oilKmTv, LinearLayout.LayoutParams(dp(190), WRAP))
+                  oRow.addView(oPlus, LinearLayout.LayoutParams(dp(48), dp(48)))
+                  oil.addView(oRow, lpMatch(10))
+                  val oReset = button("تم تبديل الزيت (تصفير العداد)", GREEN, 15f)
+                  val rp = LinearLayout.LayoutParams(MATCH, dp(48))
+                  rp.topMargin = dp(10)
+                  oil.addView(oReset, rp)
+                  root.addView(oil, lpMatch(12))
+                  oMinus.setOnClickListener {
+                      Tracker.oilKm = maxOf(1000, Tracker.oilKm - 500)
+                      oilChanged()
+                  }
+                  oPlus.setOnClickListener {
+                      Tracker.oilKm = minOf(10000, Tracker.oilKm + 500)
+                      oilChanged()
+                  }
+                  oReset.setOnClickListener {
+                      AlertDialog.Builder(this)
+                          .setMessage("تأكيد: تم تبديل الزيت؟ سيبدأ العداد من الصفر.")
+                          .setPositiveButton("نعم") { _, _ ->
+                              Tracker.oilStart = Tracker.total
+                              Tracker.oilNotified = false
+                              Tracker.save(this)
+                              refresh()
+                          }
+                          .setNegativeButton("لا", null)
+                          .show()
+                  }
+
+                  startBtn = button("ابدأ القياس", GREEN, 20f)
+                  val sp = LinearLayout.LayoutParams(MATCH, dp(60))
+                  sp.topMargin = dp(14)
+                  root.addView(startBtn, sp)
+                  simBtn = button("تجربة (سرعة وهمية)", KEY, 15f)
+                  val sp2 = LinearLayout.LayoutParams(MATCH, dp(48))
+                  sp2.topMargin = dp(8)
+                  root.addView(simBtn, sp2)
+                  startBtn.setOnClickListener {
+                      if (Tracker.running && !Tracker.sim) send(TrackingService.ACTION_STOP) else begin(false)
+                  }
+                  simBtn.setOnClickListener {
+                      if (Tracker.sim) send(TrackingService.ACTION_STOP) else begin(true)
+                  }
+
+                  val sOv = Switch(this)
+                  sOv.text = "عرض السرعة فوق التطبيقات (نافذة عائمة)"
+                  sOv.setTextColor(Color.WHITE)
+                  sOv.isChecked = Tracker.overlay
+                  val sMute = Switch(this)
+                  sMute.text = "كتم الصوت"
+                  sMute.setTextColor(Color.WHITE)
+                  sMute.isChecked = Tracker.mute
+                  root.addView(sOv, lpMatch(14))
+                  root.addView(sMute, lpMatch(6))
+                  sOv.setOnCheckedChangeListener { _, on ->
+                      Tracker.overlay = on
+                      Tracker.save(this)
+                      if (on && !Settings.canDrawOverlays(this)) {
+                          Toast.makeText(this, "فعّل صلاحية العرض فوق التطبيقات ثم ارجع", Toast.LENGTH_LONG).show()
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      } else if (Tracker.running) {
+                          send(TrackingService.ACTION_REFRESH)
+                      }
+                  }
+                  sMute.setOnCheckedChangeListener { _, on ->
+                      Tracker.mute = on
+                      Tracker.save(this)
+                  }
+
+                  root.addView(text("سجل المسافة لكل يوم", 18f, Color.WHITE, true), lpMatch(22))
+                  totalTv = text("", 14f, SUB)
+                  root.addView(totalTv, lpMatch(4))
+                  histBox = LinearLayout(this)
+                  histBox.orientation = LinearLayout.VERTICAL
+                  histBox.background = rounded(CARD, 18)
+                  histBox.setPadding(dp(10), dp(8), dp(10), dp(8))
+                  root.addView(histBox, lpMatch(8))
+                  root.addView(text("لا تلمس الجوال أثناء القيادة. التحذير بالصوت والاهتزاز.", 12f, SUB), lpMatch(14))
+
+                  setContentView(sv)
+              }
+
+              private fun histRow(a: String, b: String, c: String, d: String, head: Boolean): LinearLayout {
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.setPadding(0, dp(6), 0, dp(6))
+                  val col = if (head) SUB else Color.WHITE
+                  val ws = floatArrayOf(1.4f, 1.1f, 0.9f, 0.8f)
+                  val ts = arrayOf(a, b, c, d)
+                  for (i in 0 until 4) {
+                      val t = text(ts[i], 13f, col, head)
+                      t.gravity = Gravity.CENTER
+                      row.addView(t, LinearLayout.LayoutParams(0, WRAP, ws[i]))
+                  }
+                  return row
+              }
+
+              private fun buildHistory() {
+                  histBox.removeAllViews()
+                  histBox.addView(histRow("التاريخ", "المسافة", "أعلى سرعة", "الوقت", true))
+                  for (r in Tracker.history(this)) {
+                      histBox.addView(histRow(r.date, fmtDist(r.dist), r.max.roundToInt().toString(), fmtTime(r.sec), false))
+                  }
+              }
+
+              private fun refresh() {
+                  speedTv.text = Tracker.speed.roundToInt().toString()
+                  speedTv.setTextColor(if (Tracker.over) RED else Color.WHITE)
+                  warnTv.visibility = if (Tracker.over) View.VISIBLE else View.GONE
+                  limitTv.text = "حد التحذير: ${Tracker.limit}"
+                  distTv.text = fmtDist(Tracker.dist)
+                  maxTv.text = Tracker.max.roundToInt().toString()
+                  timeTv.text = fmtTime(Tracker.sec)
+                  val real = Tracker.running && !Tracker.sim
+                  startBtn.text = if (real) "إيقاف القياس" else "ابدأ القياس"
+                  startBtn.background = rounded(if (real) RED else GREEN, 18)
+                  simBtn.text = if (Tracker.sim) "إيقاف التجربة" else "تجربة (سرعة وهمية)"
+                  val since = Tracker.oilSince()
+                  val rem = Tracker.oilKm * 1000.0 - since
+                  oilKmTv.text = "التبديل كل ${Tracker.oilKm} كم"
+                  oilInfo.text = if (rem > 0) "قطعت ${fmtKm(since)} منذ آخر تبديل - المتبقي ${fmtKm(rem)}" else "تجاوزت الموعد بـ ${fmtKm(-rem)}"
+                  oilBar.progress = minOf(1000, (since / (Tracker.oilKm * 1000.0) * 1000).toInt())
+                  oilBar.progressTintList = ColorStateList.valueOf(if (Tracker.oilDue()) RED else GREEN)
+                  oilWarn.visibility = if (Tracker.oilDue()) View.VISIBLE else View.GONE
+                  totalTv.text = "إجمالي ما قطعته: ${fmtKm(Tracker.total)}"
+                  tick++
+                  if (tick % 10 == 0) buildHistory()
+              }
+
+              private fun send(action: String) {
+                  startService(Intent(this, TrackingService::class.java).setAction(action))
+              }
+
+              private fun begin(sim: Boolean) {
+                  val need = ArrayList<String>()
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                      need.add(Manifest.permission.ACCESS_FINE_LOCATION)
+                      need.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 && !askedNotif &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      askedNotif = true
+                      need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  if (need.isNotEmpty()) {
+                      pendingSim = sim
+                      requestPermissions(need.toTypedArray(), 1)
+                      return
+                  }
+                  if (!sim) {
+                      val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                      if (!lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                          Toast.makeText(this, "شغّل الـ GPS (الموقع) ثم اضغط ابدأ", Toast.LENGTH_LONG).show()
+                          startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                          return
+                      }
+                  }
+                  val i = Intent(this, TrackingService::class.java)
+                  i.action = if (sim) TrackingService.ACTION_SIM else TrackingService.ACTION_START
+                  startForegroundService(i)
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                      begin(pendingSim)
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  Tracker.listener = { runOnUiThread { refresh() } }
+                  refresh()
+                  buildHistory()
+                  if (Tracker.overlay && Tracker.running && Settings.canDrawOverlays(this)) {
+                      send(TrackingService.ACTION_REFRESH)
+                  }
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  Tracker.listener = null
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speed-meter-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
